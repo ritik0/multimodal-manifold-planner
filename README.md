@@ -50,7 +50,7 @@ a projector `project(x)` that maps a sample to the mode constraint set
 
 
 
-a validity check `is\\\_valid(x)` used as a feasibility proxy (stand-in for torque/payload feasibility)
+a validity check `is_valid(x)` used as a feasibility proxy (stand-in for torque/payload feasibility)
 
 
 
@@ -62,7 +62,7 @@ Mode switching is performed via intersection-based transitions:
 
 
 
-For each adjacent mode pair (A â†’ B), a transition configuration `xT âˆˆ A âˆ© B` is sampled using alternating projections.
+For each adjacent mode pair (A, B), a transition configuration is sampled using alternating projections.
 
 
 
