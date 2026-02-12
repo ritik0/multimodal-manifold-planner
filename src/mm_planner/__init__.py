@@ -1,1 +1,2 @@
-from .demo_two_tables import plan_multimodal_two_tables_3d, demo_run_and_visualize
+from .demo_two_tables import demo_run_and_visualize
+from .planner_v2 import plan_multimodal_v2

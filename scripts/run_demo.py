@@ -1,10 +1,8 @@
-from mm_planner.demo_two_tables import demo_run_and_visualize
+# v2
+from mm_planner.demo_two_tables import demo_run_and_visualize_v2 as run
 
-
-def main():
-    # Runs the full 3D two-table multimodal demo and opens a PyVista window
-    demo_run_and_visualize()
-
+# v1 (uncomment to run v1)
+#from mm_planner.demo_two_tables_v1 import demo_run_and_visualize as run
 
 if __name__ == "__main__":
-    main()
+    run()

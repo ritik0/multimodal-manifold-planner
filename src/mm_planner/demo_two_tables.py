@@ -1,118 +1,10 @@
 import numpy as np
-
+import pyvista as pv
 from .modes import make_two_tables_problem_3d
-from .rrt import (
-    rrt_connect_on_mode,
-    direct_connect_on_mode,
-)
-from .transitions import sample_transition
-
-
-def plan_multimodal_two_tables_3d(
-    x_start,
-    x_goal,
-    *,
-    L=1.0, W=0.6, G=1.0,
-    table_height=0.75,
-    transition_width=0.2,
-    z_max=2.0,
-    lift_epsilon=0.02,
-    feasible_edge_margin=0.25,
-    seed=7,
-    step=0.12,
-):
-    np.random.seed(seed)
-
-    modes, _, meta = make_two_tables_problem_3d(
-        L=L, W=W, G=G,
-        table_height=table_height,
-        transition_width=transition_width,
-        z_max=z_max,
-        lift_epsilon=lift_epsilon,
-        feasible_edge_margin=feasible_edge_margin,
-    )
-
-    # Project start/goal to their respective slide manifolds.
-    x_cur = np.asarray(modes[0].project(x_start), dtype=float)
-    x_goal_proj = np.asarray(modes[-1].project(x_goal), dtype=float)
-
-    # ------------------------------------------------------------
-    # Explicit intersection-based transitions
-    # ------------------------------------------------------------
-    # We sample a transition configuration in the intersection for each
-    # adjacent pair (A,B), then plan within A to reach it, then continue.
-    # This forces the Carry segment to be planned (not directly jumped).
-    ambient_bounds = meta["ambient_bounds"]
-
-    transition_points = []
-    for i in range(len(modes) - 1):
-        A = modes[i]
-        B = modes[i + 1]
-        xT = sample_transition(A, B, ambient_bounds, attempts=4000)
-        if xT is None:
-            raise RuntimeError(
-                f"Could not find an intersection sample for transition {A.name} -> {B.name}. "
-                "Try increasing transition_width, reducing lift_epsilon, or increasing attempts."
-            )
-        transition_points.append(np.asarray(xT, dtype=float))
-
-    full_path = [x_cur.copy()]
-
-    # Plan sequentially in each mode to the intersection point
-    for i, A in enumerate(modes[:-1]):
-        xT = transition_points[i]
-        xT_A = np.asarray(A.project(xT), dtype=float)
-
-        seg = rrt_connect_on_mode(
-            x_cur,
-            xT_A,
-            A,
-            iters=8000,
-            step=step,
-            goal_bias=0.25,
-            table_height_for_cost=table_height,
-            max_nodes=20000,
-            time_budget_sec=4.0,
-            stop_after_first=True,
-        )
-        if seg is None:
-            seg = direct_connect_on_mode(x_cur, xT_A, A, step=min(step, 0.06))
-        if seg is None:
-            raise RuntimeError(
-                f"Could not plan inside mode {A.name} to reach its transition point. "
-                "Try increasing iters/time_budget or lowering step."
-            )
-
-        full_path.extend([np.asarray(p, dtype=float) for p in seg[1:]])
-
-        # Switch: since the endpoint lies in the intersection, we can enter B.
-        B = modes[i + 1]
-        x_cur = np.asarray(B.project(full_path[-1]), dtype=float)
-
-    # Final segment on SlideRight to goal.
-    seg_last = rrt_connect_on_mode(
-        x_cur,
-        x_goal_proj,
-        modes[-1],
-        iters=8000,
-        step=step,
-        goal_bias=0.35,
-        table_height_for_cost=table_height,
-        max_nodes=20000,
-        time_budget_sec=4.0,
-        stop_after_first=True,
-    )
-    if seg_last is None:
-        seg_last = direct_connect_on_mode(x_cur, x_goal_proj, modes[-1], step=min(step, 0.06))
-    if seg_last is None:
-        raise RuntimeError(f"Could not plan on {modes[-1].name} to goal.")
-
-    full_path.extend([np.asarray(p, dtype=float) for p in seg_last[1:]])
-    return np.asarray(full_path, dtype=float), modes, meta
+from .planner_v2 import plan_multimodal_v2
 
 
 def visualize_two_tables_3d_pyvista(path, meta, show_points=True):
-    import pyvista as pv
 
     L = meta["L"]
     W = meta["W"]
@@ -156,36 +48,65 @@ def visualize_two_tables_3d_pyvista(path, meta, show_points=True):
     p.add_mesh(goal_s)
 
     p.add_axes()
-    p.add_title("Two-table multimodal (intersection-based switching + planned carry)")
+    p.add_title("Two-table multimodal")
     p.show()
 
 
-def demo_run_and_visualize():
+def demo_run_and_visualize_v2():
+    # Scene params
     L = 1.0
     W = 0.6
     G = 1.0
     table_height = 0.75
-    #### START AND GOAL POSITIONS
+
+    # Fixed start/goal (change if you want random)
     x_start = np.array([0.2, 0.0, table_height])
     x_goal = np.array([2.0 * L + G - 0.2, 0.0, table_height])
+    # Put it around middle of the gap at safe carry height
+    # x_goal = np.array([L + 0.5 * G, 0.0, table_height + 0.25])
 
-    path, modes, meta = plan_multimodal_two_tables_3d(
-        x_start=x_start,
-        x_goal=x_goal,
-        L=L, W=W, G=G,
+    modes, ambient_bounds, meta = make_two_tables_problem_3d(
+        L=L,
+        W=W,
+        G=G,
         table_height=table_height,
         transition_width=0.2,
         z_max=2.0,
         lift_epsilon=0.02,
         feasible_edge_margin=0.25,
-        seed=7,
-        step=0.12,
     )
 
-    print("Modes:", " -> ".join([m.name for m in modes]))
-    print("Path points:", len(path))
+    path, dbg = plan_multimodal_v2(
+        x_start,
+        x_goal,
+        modes=modes,
+        ambient_bounds=ambient_bounds,
+        meta=meta,
+        # graph build
+        attempts_per_pair=4000,
+        max_transitions_per_edge=5,
+        base_switch_cost=1.0,
+        # continuous planner
+        rrt_step=0.12,
+        rrt_iters=9000,
+        rrt_time_budget_sec=4.0,
+        goal_bias=0.30,
+        # keep carry planned (no direct fallback in CarryFree)
+        forbid_direct_in_modes=["CarryFree"],
+        transition_pick_policy="closest_on_src",
+    )
+
+    seq_names = [modes[i].name for i in dbg.mode_sequence]
+    print("v2 mode sequence:", " -> ".join(seq_names))
+    print("path points:", len(path))
+
     visualize_two_tables_3d_pyvista(path, meta, show_points=True)
 
 
+# Keep old name if scripts/run_demo.py expects demo_run_and_visualize()
+def demo_run_and_visualize():
+    demo_run_and_visualize_v2()
+
+
 if __name__ == "__main__":
-    demo_run_and_visualize()
+    demo_run_and_visualize_v2()
