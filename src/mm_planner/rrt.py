@@ -52,10 +52,6 @@ def constrained_extend(
     table_height_for_cost: float,
     max_nodes: int,
 ):
-    """
-    Extend toward x_target with projection, validity, and cost accumulation.
-    Returns index of last added node or None.
-    """
     if len(X) >= max_nodes:
         return None
 
@@ -144,12 +140,6 @@ def rrt_connect_on_mode(
     time_budget_sec=3.0,          # <--- makes it “finish” fast
     stop_after_first=True,        # <--- set False if you want best-cost
 ):
-    """
-    Constrained RRT:
-    - vectorized nearest search
-    - optional time budget to prevent long runs
-    - optional stop_after_first for interactive demos
-    """
     t0 = time.perf_counter()
 
     xs = np.asarray(mode.project(x_start), dtype=float)
@@ -237,10 +227,6 @@ def rrt_reach_switch(
     max_nodes=12000,
     time_budget_sec=2.0,         # <--- prevents “stuck feeling”
 ):
-    """
-    Grow tree on modeA; return path to a node from which we can switch into modeB.
-    Uses time budget to keep interactive runs fast.
-    """
     t0 = time.perf_counter()
 
     xs = np.asarray(modeA.project(x_start), dtype=float)

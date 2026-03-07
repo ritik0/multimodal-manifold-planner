@@ -1,4 +1,25 @@
+"""
+This file demonstrates a multimodal motion planner for moving a point-object
+from a left table to a right table (or into the gap) using a fixed sequence of modes:
+SlideLeft -> LiftLeft -> Carry -> LiftRight -> SlideRight.
+
+How it works:
+1) Build the scene and mode constraints (tables + lift/carry regions).
+2) Project the start onto the first slide mode and the goal onto the final slide mode.
+3) For each adjacent pair of modes, sample one "transition point" that lies in the
+   intersection of both modes (found by alternating projections). This point acts like
+   a doorway between modes.
+4) Plan in modes: in each mode, run constrained RRT from the current state to that
+   mode's transition point.
+5) At the transition point, switch to the next mode and continue.
+6) After the last mode, plan the final segment to the projected goal.
+7) Visualize the tables, mode regions, and the final path in PyVista.
+
+NOTE: The mode order is hardcoded; the planner does not search over mode sequences.
+"""
+
 import numpy as np
+import pyvista as pv
 
 from .modes import make_two_tables_problem_3d
 from .rrt import (
@@ -36,12 +57,6 @@ def plan_multimodal_two_tables_3d(
     x_cur = np.asarray(modes[0].project(x_start), dtype=float)
     x_goal_proj = np.asarray(modes[-1].project(x_goal), dtype=float)
 
-    # ------------------------------------------------------------
-    # Explicit intersection-based transitions
-    # ------------------------------------------------------------
-    # We sample a transition configuration in the intersection for each
-    # adjacent pair (A,B), then plan within A to reach it, then continue.
-    # This forces the Carry segment to be planned (not directly jumped).
     ambient_bounds = meta["ambient_bounds"]
 
     transition_points = []
@@ -112,8 +127,6 @@ def plan_multimodal_two_tables_3d(
 
 
 def visualize_two_tables_3d_pyvista(path, meta, show_points=True):
-    import pyvista as pv
-
     L = meta["L"]
     W = meta["W"]
     G = meta["G"]
@@ -156,7 +169,7 @@ def visualize_two_tables_3d_pyvista(path, meta, show_points=True):
     p.add_mesh(goal_s)
 
     p.add_axes()
-    p.add_title("Two-table multimodal (intersection-based switching + planned carry)")
+    p.add_title("Two-table multimodal")
     p.show()
 
 
@@ -167,9 +180,9 @@ def demo_run_and_visualize():
     table_height = 0.75
     #### START AND GOAL POSITIONS
     x_start = np.array([0.2, 0.0, table_height])
-    # x_goal = np.array([2.0 * L + G - 0.2, 0.0, table_height])
+    x_goal = np.array([2.0 * L + G - 0.2, 0.0, table_height])
     # Put it around middle of the gap at safe carry height
-    x_goal = np.array([L + 0.5 * G, 0.0, table_height + 0.25])
+    #x_goal = np.array([L + 0.5 * G, 0.0, table_height + 0.25])
 
     path, modes, meta = plan_multimodal_two_tables_3d(
         x_start=x_start,

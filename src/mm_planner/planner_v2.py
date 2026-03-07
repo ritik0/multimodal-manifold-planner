@@ -1,3 +1,18 @@
+"""
+  1) Assign start and goal to valid modes (projection + validity).
+  2) Build a ModeGraph by trying to sample intersection "doors" xT ∈ M_A ∩ M_B
+     for all mode pairs (A -> B). Only successful pairs become graph edges.
+  3) Use Dijkstra on the mode graph to choose the cheapest mode sequence from
+     start_mode to goal_mode (costs encode preferences like "carry is expensive").
+  4) For each chosen mode transition A -> B:
+       - pick a cached door point (by default: closest-to-current in mode A),
+       - plan inside mode A using constrained RRT to reach that door,
+       - switch to mode B at the door (projection into B),
+     and append the segment to the full path.
+  5) Plan the final segment inside the goal mode to reach the projected goal.
+  6) Return the concatenated path plus debug info (chosen modes, doors used, segment stats).
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -29,13 +44,6 @@ class PlanDebug:
 
 
 def pick_mode_for_state(x: np.ndarray, modes) -> Tuple[int, np.ndarray]:
-    """
-    Choose the "best" mode for a state:
-      - project x onto each mode
-      - keep only valid projections
-      - choose smallest projection distance
-    Returns (mode_index, projected_x)
-    """
     x = np.asarray(x, dtype=float)
     best = None
     best_score = float("inf")
@@ -79,17 +87,7 @@ def plan_multimodal_v2(
     forbid_direct_in_modes: Optional[List[str]] = None,
     transition_pick_policy: str = "closest_on_src",
 ) -> Tuple[np.ndarray, PlanDebug]:
-    """
-    v2 planner:
-      1) pick start/goal mode
-      2) build transition graph (intersection-based)
-      3) run Dijkstra to get mode sequence
-      4) for each edge in that sequence:
-           pick a cached transition sample xT ∈ M_A ∩ M_B
-           plan within A to reach xT
-           switch to B
-      5) final plan in goal mode to x_goal
-    """
+
     forbid_direct_in_modes = forbid_direct_in_modes or ["CarryFree"]
 
     # 1) start/goal mode

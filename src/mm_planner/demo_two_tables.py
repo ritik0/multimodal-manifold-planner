@@ -1,3 +1,21 @@
+"""
+v2 demo for the two-table scenario (Transition Graph + Dijkstra + piecewise RRT).
+
+What this file does:
+1) Builds a simple 3D scene with two tables separated by a gap and defines multiple
+   motion modes (slide on tables, lift near edges, carry over the gap).
+2) Runs the v2 multimodal planner:
+   - assigns start and goal to the best valid modes (via projection + validity).
+   - Tries to find intersection "door" samples between ALL mode pairs and stores the
+     successful ones as edges in a mode-transition graph.
+   - Runs Dijkstra on this graph (using mode/transition costs) to choose the cheapest
+     mode sequence from start mode to goal mode.
+   - Plans continuously inside each selected mode using RRT to reach the chosen door,
+     switches mode at that intersection point, and concatenates all segments into one path.
+3) Visualizes the environment next using pyvista
+
+"""
+
 import numpy as np
 import pyvista as pv
 from .modes import make_two_tables_problem_3d
@@ -63,7 +81,7 @@ def demo_run_and_visualize_v2():
     x_start = np.array([0.2, 0.0, table_height])
     x_goal = np.array([2.0 * L + G - 0.2, 0.0, table_height])
     # Put it around middle of the gap at safe carry height
-    # x_goal = np.array([L + 0.5 * G, 0.0, table_height + 0.25])
+    #x_goal = np.array([L + 0.5 * G, 0.0, table_height + 0.25])
 
     modes, ambient_bounds, meta = make_two_tables_problem_3d(
         L=L,
@@ -84,7 +102,7 @@ def demo_run_and_visualize_v2():
         meta=meta,
         # graph build
         attempts_per_pair=4000,
-        max_transitions_per_edge=5,
+        max_transitions_per_edge=5, #number of trasntion points per mode intersection
         base_switch_cost=1.0,
         # continuous planner
         rrt_step=0.12,
@@ -102,8 +120,6 @@ def demo_run_and_visualize_v2():
 
     visualize_two_tables_3d_pyvista(path, meta, show_points=True)
 
-
-# Keep old name if scripts/run_demo.py expects demo_run_and_visualize()
 def demo_run_and_visualize():
     demo_run_and_visualize_v2()
 

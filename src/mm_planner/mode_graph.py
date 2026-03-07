@@ -1,3 +1,8 @@
+"""
+it discovers which modes can switch into which via the intersectrion doors, stores them and provides 
+them to the discrete search + continuous planner.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,10 +23,6 @@ class Edge:
 
 
 class ModeGraph:
-    """
-    Directed graph over modes.
-    Edge i->j exists if we can sample at least one intersection transition xT ∈ M_i ∩ M_j.
-    """
 
     def __init__(self, modes, ambient_bounds):
         self.modes = modes
@@ -64,12 +65,6 @@ class ModeGraph:
         x_cur: np.ndarray,
         policy: str = "closest_on_src",
     ) -> Optional[np.ndarray]:
-        """
-        Choose one cached transition sample for edge i->j.
-        policy:
-          - "first": first cached
-          - "closest_on_src": choose xT that is closest to x_cur after projecting to src mode
-        """
         Ts = self.get_transitions(i, j)
         if not Ts:
             return None
@@ -102,14 +97,6 @@ class ModeGraph:
         base_switch_cost: float = 1.0,
         verbose: bool = True,
     ):
-        """
-        Build edges by sampling intersections.
-
-        If use_all_pairs=True: tries all ordered pairs (i,j).
-        If candidate_pairs is provided: only tries those pairs.
-
-        Edge cost: base_switch_cost + dst_mode_penalty (from modes[j].cost_weight["mode_penalty"] if present)
-        """
         n = len(self.modes)
 
         if not use_all_pairs and candidate_pairs is None:
@@ -130,7 +117,7 @@ class ModeGraph:
 
             # compute base cost using mode penalties (keeps “carry expensive” etc.)
             dst_pen = 0.0
-            if hasattr(B, "cost_weight") and isinstance(B.cost_weight, dict):
+            if hasattr(B, "cost_weight") and isinstance(B.cost_weight, dict): 
                 dst_pen = float(B.cost_weight.get("mode_penalty", 0.0))
             base_cost = float(base_switch_cost + dst_pen)
 

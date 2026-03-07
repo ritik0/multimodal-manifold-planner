@@ -13,12 +13,6 @@ def dijkstra_mode_sequence(
     *,
     extra_node_cost: Optional[Dict[int, float]] = None,
 ) -> List[int]:
-    """
-    Dijkstra over modes (nodes), using edge.base_cost.
-
-    extra_node_cost: optional dict of per-node costs added when entering a node.
-    Returns: list of mode indices [start, ..., goal].
-    """
     if start_mode == goal_mode:
         return [start_mode]
 
