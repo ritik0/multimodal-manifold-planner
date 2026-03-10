@@ -1,55 +1,95 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable
+
 import numpy as np
 
 
 def _clip_to_bounds(x: np.ndarray, ambient_bounds):
-    """Clip each coordinate of x to ambient bounds."""
     y = np.asarray(x, dtype=float).copy()
     for i, (lo, hi) in enumerate(ambient_bounds):
         y[i] = np.clip(y[i], lo, hi)
     return y
 
 
-class Mode:
-    """
-    Explicit mode:
-    - project(x): explicit projector (clamp/snap)
-    - is_valid(x): feasibility check (region + proxy; later torque/learned feasibility)
-    - cost_weight: used for cost shaping / mode penalties
-    """
+def _numerical_jacobian(h_func: Callable[[np.ndarray], np.ndarray], x: np.ndarray, eps: float = 1e-6):
+    x = np.asarray(x, dtype=float)
+    r0 = np.asarray(h_func(x), dtype=float).reshape(-1)
+    m = r0.size
+    n = x.size
+    J = np.zeros((m, n), dtype=float)
 
-    def __init__(self, name: str, projector, ambient_bounds, *, is_valid=None, cost_weight=None):
+    for j in range(n):
+        xp = x.copy()
+        xm = x.copy()
+        xp[j] += eps
+        xm[j] -= eps
+        rp = np.asarray(h_func(xp), dtype=float).reshape(-1)
+        rm = np.asarray(h_func(xm), dtype=float).reshape(-1)
+        J[:, j] = (rp - rm) / (2.0 * eps)
+
+    return J
+
+
+@dataclass
+class TaskGeometry:
+    L: float = 0.45
+    W: float = 0.40
+    G: float = 0.30
+    table_height: float = 0.70
+    z_max: float = 1.60
+
+    object_half_length: float = 0.10
+    object_radius: float = 0.04
+
+    carry_clearance: float = 0.03
+    support_side_clearance: float = 0.01
+
+    projection_tol: float = 1e-6
+    projection_damping: float = 1e-3
+    projection_max_iters: int = 50
+
+
+class Mode:
+    def __init__(
+        self,
+        name: str,
+        family: str,
+        projector,
+        ambient_bounds,
+        *,
+        is_valid=None,
+        cost_weight=None,
+        params=None,
+        meta=None,
+    ):
         self.name = name
+        self.family = family
         self.project = projector
         self.ambient_bounds = ambient_bounds
         self.is_valid = is_valid if is_valid is not None else (lambda x: True)
         self.cost_weight = cost_weight if cost_weight is not None else {}
+        self.params = params if params is not None else {}
+        self.meta = meta if meta is not None else {}
 
     def sample_ambient(self) -> np.ndarray:
         return np.array([np.random.uniform(lo, hi) for lo, hi in self.ambient_bounds], dtype=float)
 
 
 class ImplicitMode(Mode):
-    """
-    Implicit manifold mode defined by equality constraints h(x)=0 and Jacobian J(x).
-
-    Projection uses damped least squares (Levenberg–Marquardt / Gauss-Newton):
-        dx = - J^T (J J^T + λ^2 I)^-1 h
-    with simple backtracking to avoid overshoot.
-
-    IMPORTANT: We make sure `self.project` is callable by setting:
-        self.project = self._project_impl
-    so the rest of your pipeline can keep calling mode.project(x) without changes.
-    """
-
     def __init__(
         self,
         name: str,
+        family: str,
         h_func,
         J_func,
         ambient_bounds,
         *,
         is_valid=None,
         cost_weight=None,
+        params=None,
+        meta=None,
         max_iters: int = 50,
         tol: float = 1e-6,
         damping: float = 1e-3,
@@ -58,28 +98,26 @@ class ImplicitMode(Mode):
         backtracking: bool = True,
         min_alpha: float = 1e-3,
     ):
-        # Pass a dummy callable projector to base class; we overwrite below.
         super().__init__(
             name=name,
+            family=family,
             projector=lambda x: x,
             ambient_bounds=ambient_bounds,
             is_valid=is_valid,
             cost_weight=cost_weight,
+            params=params,
+            meta=meta,
         )
-
         self.h_func = h_func
-        self.J_func = J_func
-
+        self.J_func = J_func if J_func is not None else (lambda x: _numerical_jacobian(h_func, x))
         self.max_iters = int(max_iters)
         self.tol = float(tol)
         self.damping = float(damping)
         self.step_scale = float(step_scale)
         self.clip_each_iter = bool(clip_each_iter)
-
         self.backtracking = bool(backtracking)
         self.min_alpha = float(min_alpha)
 
-        # CRITICAL: guarantee Mode-like interface (callable .project)
         self.project = self._project_impl
 
     def _project_impl(self, x0: np.ndarray) -> np.ndarray:
@@ -93,8 +131,6 @@ class ImplicitMode(Mode):
 
         for _ in range(self.max_iters):
             r = np.asarray(self.h_func(x), dtype=float).reshape(-1)
-
-            # No equality constraints -> identity projection
             if r.size == 0:
                 return _clip_to_bounds(x, self.ambient_bounds)
 
@@ -102,10 +138,9 @@ class ImplicitMode(Mode):
             if nr < self.tol:
                 return _clip_to_bounds(x, self.ambient_bounds)
 
-            J = np.asarray(self.J_func(x), dtype=float)  # shape (m, n)
+            J = np.asarray(self.J_func(x), dtype=float)
             m = J.shape[0]
 
-            # Damped normal solve in constraint space
             A = J @ J.T + (self.damping ** 2) * np.eye(m)
             try:
                 y = np.linalg.solve(A, r)
@@ -114,7 +149,6 @@ class ImplicitMode(Mode):
 
             dx = -(J.T @ y)
 
-            # Backtracking line search (optional)
             alpha = self.step_scale
             x_new = x + alpha * dx
             if self.clip_each_iter:
@@ -131,194 +165,272 @@ class ImplicitMode(Mode):
                     nn = residual_norm(x_new)
 
             x = x_new
+
             if not np.all(np.isfinite(x)):
                 break
 
-        # Best-effort return
         return _clip_to_bounds(x, self.ambient_bounds)
 
 
 def make_two_tables_problem_3d(
     *,
-    L=1.0,
-    W=0.6,
-    G=1.0,
-    table_height=0.75,
-    transition_width=0.2,
-    z_max=2.0,
-    lift_epsilon=0.02,
-    # Feasibility proxy parameters (placeholder for torque/power feasibility)
-    feasible_edge_margin=0.25,   # must be within last 25cm of table to lift/carry
-    feasible_y_margin=None,      # optional: restrict y (e.g., near centerline)
+    L=0.45,
+    W=0.40,
+    G=0.30,
+    table_height=0.70,
+    z_max=1.60,
+    object_half_length=0.10,
+    object_radius=0.04,
+    carry_clearance=0.03,
+    support_side_clearance=0.01,
+    projection_tol=1e-6,
+    projection_damping=1e-3,
+    projection_max_iters=50,
+    transition_width=None,
+    lift_epsilon=None,
+    feasible_edge_margin=None,
+    **kwargs,
 ):
-    L = float(L)
-    W = float(W)
-    G = float(G)
-    ht = float(table_height)
-    w = float(transition_width)
-    z_max = float(z_max)
-    eps = float(lift_epsilon)
+    geom = TaskGeometry(
+        L=float(L),
+        W=float(W),
+        G=float(G),
+        table_height=float(table_height),
+        z_max=float(z_max),
+        object_half_length=float(object_half_length),
+        object_radius=float(object_radius),
+        carry_clearance=float(carry_clearance),
+        support_side_clearance=float(support_side_clearance),
+        projection_tol=float(projection_tol),
+        projection_damping=float(projection_damping),
+        projection_max_iters=int(projection_max_iters),
+    )
 
-    x_min, x_max = 0.0, 2 * L + G
-    y_min, y_max = -W / 2.0, W / 2.0
+    L = geom.L
+    W = geom.W
+    G = geom.G
+    ht = geom.table_height
+    z_max = geom.z_max
+
+    x_min, x_max = 0.0, 2.0 * L + G
+    y_half = 0.5 * W
+    y_min, y_max = -y_half, y_half
     ambient_bounds = [(x_min, x_max), (y_min, y_max), (0.0, z_max)]
 
-    # ------------------------
-    # Feasibility proxy
-    # ------------------------
-    def feasible_left(p):
-        x, y, z = p
-        if x < L - feasible_edge_margin:
-            return False
-        if feasible_y_margin is not None and abs(y) > feasible_y_margin:
-            return False
-        return True
+    support_y_limit = max(0.0, y_half - geom.object_radius - geom.support_side_clearance)
+    free_y_limit = max(0.0, y_half - geom.object_radius)
 
-    def feasible_right(p):
-        x, y, z = p
-        if x > (L + G + feasible_edge_margin):
-            return False
-        if feasible_y_margin is not None and abs(y) > feasible_y_margin:
-            return False
-        return True
+    support_z = ht
+    carry_z_min = ht + geom.object_radius + geom.carry_clearance
 
-    def feasible_lift(p):
-        x, y, z = p
-        return z >= ht
+    # Make lift/place bands overlap with free-transfer region
+    overlap_margin = 0.02
+    transition_band = max(0.05, (carry_z_min - support_z) + overlap_margin)
+    lift_band = transition_band
+    place_band = transition_band
 
-    def feasible_carry(p):
-        x, y, z = p
-        return z >= ht + eps
+    def h_support_contact(p):
+        return np.array([p[2] - support_z], dtype=float)
 
-    # ------------------------
-    # Implicit constraints (equalities) and Jacobians
-    # ------------------------
-    # Slide plane: z - ht = 0
-    def h_slide(p):
-        return np.array([p[2] - ht], dtype=float)
-
-    def J_slide(p):
+    def J_support_contact(p):
         return np.array([[0.0, 0.0, 1.0]], dtype=float)
 
-    # Edge planes: x - L = 0 and x - (L+G) = 0
-    def h_edge_left(p):
-        return np.array([p[0] - L], dtype=float)
-
-    def J_edge_left(p):
-        return np.array([[1.0, 0.0, 0.0]], dtype=float)
-
-    def h_edge_right(p):
-        return np.array([p[0] - (L + G)], dtype=float)
-
-    def J_edge_right(p):
-        return np.array([[1.0, 0.0, 0.0]], dtype=float)
-
-    # ------------------------
-    # Carry mode: explicit region (volume) above the gap
-    # ------------------------
-    def proj_carry_free(p):
-        pp = np.array(p, dtype=float).copy()
-        # keep exact boundaries to allow intersection at x=L and x=L+G
-        pp[0] = np.clip(pp[0], L, L + G)
-        pp[1] = np.clip(pp[1], y_min, y_max)
-        pp[2] = np.clip(pp[2], ht + eps, z_max)
+    def proj_lift_from_left(p):
+        pp = np.asarray(p, dtype=float).copy()
+        pp[0] = np.clip(pp[0], 0.0, L)
+        pp[1] = np.clip(pp[1], -support_y_limit, support_y_limit)
+        pp[2] = np.clip(pp[2], support_z, min(z_max, support_z + lift_band))
         return pp
 
-    # ------------------------
-    # Validity checks (inequalities / region constraints)
-    # Key fix: tolerate tiny numerical noise for implicit edge planes
-    # ------------------------
-    tol_x = 1e-3
+    def proj_place_on_right(p):
+        pp = np.asarray(p, dtype=float).copy()
+        pp[0] = np.clip(pp[0], L + G, 2.0 * L + G)
+        pp[1] = np.clip(pp[1], -support_y_limit, support_y_limit)
+        pp[2] = np.clip(pp[2], support_z, min(z_max, support_z + place_band))
+        return pp
+
+    def proj_free_transfer_workspace(p):
+        pp = np.asarray(p, dtype=float).copy()
+        pp[0] = np.clip(pp[0], x_min, x_max)
+        pp[1] = np.clip(pp[1], -free_y_limit, free_y_limit)
+        pp[2] = np.clip(pp[2], carry_z_min, z_max)
+        return pp
 
     def valid_slide_left(p):
         x, y, z = p
-        return (0.0 <= x <= L) and (y_min <= y <= y_max)
+        return (
+            0.0 <= x <= L
+            and -support_y_limit <= y <= support_y_limit
+            and abs(z - support_z) <= 5e-3
+        )
 
     def valid_slide_right(p):
         x, y, z = p
-        return (L + G <= x <= 2 * L + G) and (y_min <= y <= y_max)
+        return (
+            L + G <= x <= 2.0 * L + G
+            and -support_y_limit <= y <= support_y_limit
+            and abs(z - support_z) <= 5e-3
+        )
 
-    def valid_lift_left(p):
+    def valid_lift_from_left(p):
         x, y, z = p
-        if abs(x - L) > tol_x:
-            return False
-        if not (L - w <= x <= L + tol_x):
-            return False
-        if not (y_min <= y <= y_max):
-            return False
-        if not (ht <= z <= z_max):
-            return False
-        return feasible_left(p) and feasible_lift(p)
+        return (
+            0.0 <= x <= L
+            and -support_y_limit <= y <= support_y_limit
+            and support_z <= z <= min(z_max, support_z + lift_band)
+        )
 
-    def valid_lift_right(p):
+    def valid_place_on_right(p):
         x, y, z = p
-        if abs(x - (L + G)) > tol_x:
-            return False
-        if not (L + G - tol_x <= x <= L + G + w):
-            return False
-        if not (y_min <= y <= y_max):
-            return False
-        if not (ht <= z <= z_max):
-            return False
-        return feasible_right(p) and feasible_lift(p)
+        return (
+            L + G <= x <= 2.0 * L + G
+            and -support_y_limit <= y <= support_y_limit
+            and support_z <= z <= min(z_max, support_z + place_band)
+        )
 
-    # ------------------------
-    # Costs (mode penalties used by mode_graph + RRT shaping)
-    # ------------------------
+    def valid_free_transfer_workspace(p):
+        x, y, z = p
+        return (
+            x_min <= x <= x_max
+            and -free_y_limit <= y <= free_y_limit
+            and carry_z_min <= z <= z_max
+        )
+
     slide_cost = {"z_penalty": 0.0, "mode_penalty": 0.0}
-    lift_cost  = {"z_penalty": 2.0, "mode_penalty": 0.3}
-    carry_cost = {"z_penalty": 2.0, "mode_penalty": 0.6}
+    transition_cost = {"z_penalty": 0.5, "mode_penalty": 0.2}
+    free_cost = {"z_penalty": 1.2, "mode_penalty": 0.8}
+
+    common_meta = {
+        "representation": "hybrid-explicit-implicit",
+        "state_abstraction": "reduced task position x=(x,y,z)",
+        "future_state_model": "object pose + robot configuration",
+        "tsr_ready": True,
+        "projection_method": "damped_jacobian_least_squares",
+        "geometry_parameters": {
+            "L": L,
+            "W": W,
+            "G": G,
+            "table_height": ht,
+            "object_half_length": geom.object_half_length,
+            "object_radius": geom.object_radius,
+            "carry_clearance": geom.carry_clearance,
+            "support_side_clearance": geom.support_side_clearance,
+        },
+        "derived_parameters": {
+            "support_z": support_z,
+            "support_y_limit": support_y_limit,
+            "free_y_limit": free_y_limit,
+            "carry_z_min": carry_z_min,
+            "place_band": place_band,
+            "lift_band": lift_band,
+        },
+        "planning_policy_note": (
+            "Support-contact motion is intentionally preferred. "
+            "Free transfer is allowed but penalized, so it is chosen only when needed."
+        ),
+    }
 
     modes = [
         ImplicitMode(
-            "SlideLeft",
-            h_slide,
-            J_slide,
-            ambient_bounds,
+            name="SlideLeft",
+            family="SupportContact",
+            h_func=h_support_contact,
+            J_func=J_support_contact,
+            ambient_bounds=ambient_bounds,
             is_valid=valid_slide_left,
             cost_weight=slide_cost,
-            max_iters=25,
-            damping=1e-3,
-            backtracking=True,
-        ),
-        ImplicitMode(
-            "LiftLeftZone",
-            h_edge_left,
-            J_edge_left,
-            ambient_bounds,
-            is_valid=valid_lift_left,
-            cost_weight=lift_cost,
-            max_iters=30,
-            damping=1e-3,
+            params={"side": "left", "support_z": support_z, "support_y_limit": support_y_limit},
+            meta={
+                **common_meta,
+                "semantic_role": "preferred support-contact transport on left table",
+                "equality_constraints": ["z = support_z"],
+                "inequality_constraints": ["0 <= x <= L", "|y| <= support_y_limit"],
+                "transition_conditions": ["can remain in support-contact", "can transition to LiftFromLeftSupport"],
+            },
+            max_iters=geom.projection_max_iters,
+            tol=geom.projection_tol,
+            damping=geom.projection_damping,
             backtracking=True,
         ),
         Mode(
-            "CarryFree",
-            proj_carry_free,
-            ambient_bounds,
-            is_valid=lambda p: feasible_carry(p),
-            cost_weight=carry_cost,
+            name="LiftFromLeftSupport",
+            family="SupportTransition",
+            projector=proj_lift_from_left,
+            ambient_bounds=ambient_bounds,
+            is_valid=valid_lift_from_left,
+            cost_weight=transition_cost,
+            params={"side": "left", "x_range": [0.0, L], "support_z": support_z, "lift_band": lift_band},
+            meta={
+                **common_meta,
+                "semantic_role": "lift initiation from left support",
+                "equality_constraints": [],
+                "inequality_constraints": [
+                    "0 <= x <= L",
+                    "|y| <= support_y_limit",
+                    f"support_z <= z <= support_z + {lift_band}",
+                ],
+                "transition_conditions": ["enters from SlideLeft", "exits to FreeTransferWorkspace"],
+            },
+        ),
+        Mode(
+            name="FreeTransferWorkspace",
+            family="FreeTransfer",
+            projector=proj_free_transfer_workspace,
+            ambient_bounds=ambient_bounds,
+            is_valid=valid_free_transfer_workspace,
+            cost_weight=free_cost,
+            params={"x_range": [x_min, x_max], "y_range": [-free_y_limit, free_y_limit], "carry_z_min": carry_z_min},
+            meta={
+                **common_meta,
+                "semantic_role": "workspace-wide unsupported transfer, penalized",
+                "equality_constraints": [],
+                "inequality_constraints": [
+                    "x_min <= x <= x_max",
+                    "|y| <= free_y_limit",
+                    "z >= carry_z_min",
+                ],
+                "transition_conditions": ["enters from support-lift", "exits to support-place or remains in free transfer"],
+            },
+        ),
+        Mode(
+            name="PlaceOnRightSupport",
+            family="SupportTransition",
+            projector=proj_place_on_right,
+            ambient_bounds=ambient_bounds,
+            is_valid=valid_place_on_right,
+            cost_weight=transition_cost,
+            params={"side": "right", "x_range": [L + G, 2.0 * L + G], "support_z": support_z, "place_band": place_band},
+            meta={
+                **common_meta,
+                "semantic_role": "placement corridor onto right support",
+                "equality_constraints": [],
+                "inequality_constraints": [
+                    "L + G <= x <= 2L + G",
+                    "|y| <= support_y_limit",
+                    f"support_z <= z <= support_z + {place_band}",
+                ],
+                "transition_conditions": ["enters from FreeTransferWorkspace", "exits to SlideRight"],
+            },
         ),
         ImplicitMode(
-            "LiftRightZone",
-            h_edge_right,
-            J_edge_right,
-            ambient_bounds,
-            is_valid=valid_lift_right,
-            cost_weight=lift_cost,
-            max_iters=30,
-            damping=1e-3,
-            backtracking=True,
-        ),
-        ImplicitMode(
-            "SlideRight",
-            h_slide,
-            J_slide,
-            ambient_bounds,
+            name="SlideRight",
+            family="SupportContact",
+            h_func=h_support_contact,
+            J_func=J_support_contact,
+            ambient_bounds=ambient_bounds,
             is_valid=valid_slide_right,
             cost_weight=slide_cost,
-            max_iters=25,
-            damping=1e-3,
+            params={"side": "right", "support_z": support_z, "support_y_limit": support_y_limit},
+            meta={
+                **common_meta,
+                "semantic_role": "preferred support-contact transport on right table",
+                "equality_constraints": ["z = support_z"],
+                "inequality_constraints": ["L + G <= x <= 2L + G", "|y| <= support_y_limit"],
+                "transition_conditions": ["can be reached after placing on support", "preferred whenever support-contact is available"],
+            },
+            max_iters=geom.projection_max_iters,
+            tol=geom.projection_tol,
+            damping=geom.projection_damping,
             backtracking=True,
         ),
     ]
@@ -328,12 +440,28 @@ def make_two_tables_problem_3d(
         "W": W,
         "G": G,
         "table_height": ht,
-        "transition_width": w,
         "z_max": z_max,
-        "lift_epsilon": eps,
-        "feasible_edge_margin": feasible_edge_margin,
         "ambient_bounds": ambient_bounds,
-        "implicit_projection": True,
-        "tol_x": tol_x,
+        "representation": "hybrid-explicit-implicit",
+        "mode_families": ["SupportContact", "SupportTransition", "FreeTransfer"],
+        "frozen_mode_semantics": True,
+        "geometry_parameters": {
+            "object_half_length": geom.object_half_length,
+            "object_radius": geom.object_radius,
+            "carry_clearance": geom.carry_clearance,
+            "support_side_clearance": geom.support_side_clearance,
+        },
+        "derived_parameters": {
+            "support_z": support_z,
+            "support_y_limit": support_y_limit,
+            "free_y_limit": free_y_limit,
+            "carry_z_min": carry_z_min,
+            "place_band": place_band,
+            "lift_band": lift_band,
+        },
+        "planning_preference": "prefer_support_contact_over_free_transfer",
+        "projection_method": "damped_jacobian_least_squares",
+        "tsr_ready": True,
     }
+
     return modes, ambient_bounds, meta

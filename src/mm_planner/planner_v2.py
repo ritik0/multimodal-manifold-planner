@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import random
 
 from .mode_graph import ModeGraph
 from .discrete_search import dijkstra_mode_sequence
@@ -43,10 +44,28 @@ class PlanDebug:
     segments: List[SegmentDebug]
 
 
+def _mode_family_priority(mode) -> int:
+    """
+    Lower is preferred when projection scores are equal.
+
+    This enforces the intended semantic bias:
+      SupportContact > FreeTransfer > SupportTransition
+    """
+    family = getattr(mode, "family", "")
+    if family == "SupportContact":
+        return 0
+    if family == "FreeTransfer":
+        return 1
+    if family == "SupportTransition":
+        return 2
+    return 10
+
+
 def pick_mode_for_state(x: np.ndarray, modes) -> Tuple[int, np.ndarray]:
     x = np.asarray(x, dtype=float)
     best = None
     best_score = float("inf")
+    best_prio = float("inf")
 
     for i, m in enumerate(modes):
         xp = np.asarray(m.project(x), dtype=float)
@@ -54,9 +73,19 @@ def pick_mode_for_state(x: np.ndarray, modes) -> Tuple[int, np.ndarray]:
             continue
         if not m.is_valid(xp):
             continue
+
         score = float(np.linalg.norm(xp - x))
-        if score < best_score:
+        prio = _mode_family_priority(m)
+
+        better = False
+        if score < best_score - 1e-12:
+            better = True
+        elif abs(score - best_score) <= 1e-12 and prio < best_prio:
+            better = True
+
+        if better:
             best_score = score
+            best_prio = prio
             best = (i, xp)
 
     if best is None:
@@ -71,22 +100,22 @@ def plan_multimodal_v2(
     modes,
     ambient_bounds,
     meta: Dict,
-    # graph build settings
     attempts_per_pair: int = 4000,
     max_transitions_per_edge: int = 1,
     base_switch_cost: float = 1.0,
-    # discrete search
     extra_node_cost: Optional[Dict[int, float]] = None,
-    # continuous planning
     rrt_step: float = 0.12,
     rrt_iters: int = 9000,
     rrt_time_budget_sec: float = 4.0,
     goal_bias: float = 0.30,
-    # direct-connect fallback control
     allow_direct_fallback: bool = True,
     forbid_direct_in_modes: Optional[List[str]] = None,
     transition_pick_policy: str = "closest_on_src",
+    seed: Optional[int] = None,
 ) -> Tuple[np.ndarray, PlanDebug]:
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
 
     forbid_direct_in_modes = forbid_direct_in_modes or ["CarryFree"]
 
@@ -142,10 +171,8 @@ def plan_multimodal_v2(
             stop_after_first=True,
         )
 
-        used_direct = False
         if seg is None and allow_direct_fallback and (A.name not in forbid_direct_in_modes):
             seg = direct_connect_on_mode(x_cur, x_target, A, step=min(rrt_step, 0.06))
-            used_direct = seg is not None
 
         if seg is None:
             segments_dbg.append(
@@ -158,10 +185,7 @@ def plan_multimodal_v2(
             SegmentDebug(A.name, x_cur.copy(), x_target.copy(), True, len(seg_np))
         )
 
-        # append segment (avoid duplicating point at joint)
         full.extend(seg_np[1:])
-
-        # switch: because x_target is in intersection (or close), projection onto B is valid
         x_cur = np.asarray(B.project(full[-1]), dtype=float)
 
     # 5) final segment in goal mode to x_g

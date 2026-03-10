@@ -1,9 +1,13 @@
+from __future__ import annotations
+
 import numpy as np
-from .rrt import norm
+
+
+def _norm(x):
+    return float(np.linalg.norm(np.asarray(x, dtype=float)))
 
 
 def _is_implicit(mode) -> bool:
-    """Detect ImplicitMode-like interface (has h_func and J_func)."""
     return hasattr(mode, "h_func") and hasattr(mode, "J_func")
 
 
@@ -26,9 +30,10 @@ def _stacked_project_intersection_implicit(
     min_alpha=1e-3,
 ):
     """
-    Solve intersection by stacked constraints:
-        h_AB(x) = [hA(x); hB(x)] = 0
-    using damped least squares Gauss-Newton.
+    Solve intersection by stacked equalities:
+      h_AB(x) = [hA(x); hB(x)] = 0
+
+    using damped least-squares Gauss-Newton.
     """
     x = np.asarray(x0, dtype=float).copy()
     bounds = getattr(modeA, "ambient_bounds", None)
@@ -44,7 +49,6 @@ def _stacked_project_intersection_implicit(
         hA = np.asarray(modeA.h_func(x), dtype=float).reshape(-1)
         hB = np.asarray(modeB.h_func(x), dtype=float).reshape(-1)
         r = np.concatenate([hA, hB], axis=0)
-
         nr = float(np.linalg.norm(r))
         if nr < tol:
             return x, True
@@ -79,89 +83,99 @@ def _stacked_project_intersection_implicit(
                 nn = resnorm(x_new)
 
         x = x_new
+
         if not np.all(np.isfinite(x)):
             return x, False
 
-    ok = resnorm(x) < 10 * tol
-    return x, ok
+    return x, resnorm(x) < 10 * tol
 
 
 def project_intersection(modeA, modeB, z0, max_iter=50, tol=1e-6):
     """
-    Alternating projections (ping-pong): x <- P_A(x), x <- P_B(x) until stable.
-    Works for explicit and implicit modes because both provide mode.project(x).
+    Alternating projections:
+      x <- P_A(x), then x <- P_B(x)
+
+    Works for explicit/implicit mixtures because both expose mode.project(x).
     """
-    x = np.array(z0, dtype=float).copy()
+    x = np.asarray(z0, dtype=float).copy()
+
     for _ in range(max_iter):
         x_prev = x.copy()
-        x = modeA.project(x)
-        x = modeB.project(x)
-        if norm(x - x_prev) < tol:
-            xa = modeA.project(x)
-            xb = modeB.project(x)
-            ok = (norm(x - xa) < 1e-6) and (norm(x - xb) < 1e-6)
+        x = np.asarray(modeA.project(x), dtype=float)
+        x = np.asarray(modeB.project(x), dtype=float)
+
+        if _norm(x - x_prev) < tol:
+            xa = np.asarray(modeA.project(x), dtype=float)
+            xb = np.asarray(modeB.project(x), dtype=float)
+            ok = (_norm(x - xa) < 1e-6) and (_norm(x - xb) < 1e-6)
             return x, ok
 
-    xa = modeA.project(x)
-    xb = modeB.project(x)
-    ok = (norm(x - xa) < 1e-6) and (norm(x - xb) < 1e-6)
+    xa = np.asarray(modeA.project(x), dtype=float)
+    xb = np.asarray(modeB.project(x), dtype=float)
+    ok = (_norm(x - xa) < 1e-6) and (_norm(x - xb) < 1e-6)
     return x, ok
 
 
 def sample_transition(modeA, modeB, ambient_bounds, attempts=5000):
     """
-    Sample a transition ("door") xT between two modes A and B.
+    Sample a transition ("door") xT between two modes.
 
-    - If both modes are implicit, solve intersection with stacked Jacobian GN:
-        [hA(x); hB(x)] = 0
-    - Otherwise fall back to alternating projections A->B->A (ping-pong).
-
-    Returns a point xT if successful, else None.
+    Strategy:
+      - sample ambient
+      - build a few candidate initializations
+      - if both modes are implicit, solve the stacked intersection
+      - otherwise use alternating projections
+      - require final validity in both modes
     """
     implicit_pair = _is_implicit(modeA) and _is_implicit(modeB)
 
     for _ in range(attempts):
         z = np.array([np.random.uniform(lo, hi) for lo, hi in ambient_bounds], dtype=float)
 
-        # Start from something valid on A
-        xA0 = modeA.project(z)
-        if xA0 is None:
-            continue
-        xA0 = np.asarray(xA0, dtype=float)
-        if not modeA.is_valid(xA0):
-            continue
+        seeds = []
+        try:
+            seeds.append(np.asarray(modeA.project(z), dtype=float))
+        except Exception:
+            pass
+        try:
+            seeds.append(np.asarray(modeB.project(z), dtype=float))
+        except Exception:
+            pass
+        if len(seeds) >= 2:
+            seeds.append(0.5 * (seeds[0] + seeds[1]))
+        seeds.append(z)
 
-        # Compute candidate intersection
-        if implicit_pair:
-            xT, ok = _stacked_project_intersection_implicit(
-                modeA,
-                modeB,
-                xA0,
-                max_iters=80,
-                tol=1e-6,
-                damping=1e-3,
-                backtracking=True,
-            )
-            if not ok:
-                continue
-        else:
-            xT, ok = project_intersection(modeA, modeB, xA0, max_iter=40, tol=1e-6)
-            if not ok:
+        for x0 in seeds:
+            if not np.all(np.isfinite(x0)):
                 continue
 
-        xT = np.asarray(xT, dtype=float)
+            if implicit_pair:
+                xT, ok = _stacked_project_intersection_implicit(
+                    modeA,
+                    modeB,
+                    x0,
+                    max_iters=80,
+                    tol=1e-6,
+                    damping=1e-3,
+                    backtracking=True,
+                )
+            else:
+                xT, ok = project_intersection(modeA, modeB, x0, max_iter=40, tol=1e-6)
 
-        # Final validity in both modes (use each mode's own projection)
-        xA = np.asarray(modeA.project(xT), dtype=float)
-        xB = np.asarray(modeB.project(xT), dtype=float)
-        if modeA.is_valid(xA) and modeB.is_valid(xB):
-            return xT
+            if not ok:
+                continue
+
+            xT = np.asarray(xT, dtype=float)
+            xA = np.asarray(modeA.project(xT), dtype=float)
+            xB = np.asarray(modeB.project(xT), dtype=float)
+
+            if modeA.is_valid(xA) and modeB.is_valid(xB):
+                return xT
 
     return None
 
 
 def sample_k_transitions(modeA, modeB, ambient_bounds, k=3, attempts=12000):
-    """Collect up to k distinct transition samples between two modes."""
     Ts = []
     seen = set()
 
