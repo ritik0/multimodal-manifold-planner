@@ -47,17 +47,18 @@ class PlanDebug:
 def _mode_family_priority(mode) -> int:
     """
     Lower is preferred when projection scores are equal.
-
-    This enforces the intended semantic bias:
-      SupportContact > FreeTransfer > SupportTransition
     """
+    name = getattr(mode, "name", "")
+    if name in ("SlideLeft", "SlideRight"):
+        return 0
+
     family = getattr(mode, "family", "")
     if family == "SupportContact":
-        return 0
-    if family == "FreeTransfer":
         return 1
-    if family == "SupportTransition":
+    if family == "FreeTransfer":
         return 2
+    if family == "SupportTransition":
+        return 3
     return 10
 
 
@@ -93,6 +94,42 @@ def pick_mode_for_state(x: np.ndarray, modes) -> Tuple[int, np.ndarray]:
     return best
 
 
+def _prefer_surface_goal_mode(
+    x_goal: np.ndarray, g_mode: int, x_g: np.ndarray, modes, meta: Dict
+) -> Tuple[int, np.ndarray]:
+    support_z = float(meta.get("derived_parameters", {}).get("support_z", meta.get("table_height", 0.0)))
+    right_x_min = float(
+        meta.get("derived_parameters", {}).get("right_transition_x_min", meta.get("L", 0.0) + meta.get("G", 0.0))
+    )
+    surface_tol = 5e-3
+
+    x_goal = np.asarray(x_goal, dtype=float)
+    if abs(x_goal[2] - support_z) > surface_tol:
+        return g_mode, x_g
+
+    slide_right_idx = None
+    for i, m in enumerate(modes):
+        if getattr(m, "name", "") == "SlideRight":
+            slide_right_idx = i
+            break
+
+    if slide_right_idx is None:
+        return g_mode, x_g
+
+    slide_right = modes[slide_right_idx]
+    x_sr = np.asarray(slide_right.project(x_goal), dtype=float)
+    if not np.all(np.isfinite(x_sr)) or not slide_right.is_valid(x_sr):
+        return g_mode, x_g
+
+    d_cur = float(np.linalg.norm(np.asarray(x_g, dtype=float) - x_goal))
+    d_sr = float(np.linalg.norm(x_sr - x_goal))
+
+    if x_goal[0] >= right_x_min - 1e-9 and d_sr <= d_cur + 1e-12:
+        return slide_right_idx, x_sr
+
+    return g_mode, x_g
+
+
 def plan_multimodal_v2(
     x_start: np.ndarray,
     x_goal: np.ndarray,
@@ -119,11 +156,10 @@ def plan_multimodal_v2(
 
     forbid_direct_in_modes = forbid_direct_in_modes or ["CarryFree"]
 
-    # 1) start/goal mode
     s_mode, x_s = pick_mode_for_state(x_start, modes)
     g_mode, x_g = pick_mode_for_state(x_goal, modes)
+    g_mode, x_g = _prefer_surface_goal_mode(x_goal, g_mode, x_g, modes, meta)
 
-    # 2) build graph
     graph = ModeGraph(modes, ambient_bounds)
     graph.build(
         attempts_per_pair=attempts_per_pair,
@@ -133,10 +169,8 @@ def plan_multimodal_v2(
         verbose=False,
     )
 
-    # 3) discrete search (mode sequence)
     seq = dijkstra_mode_sequence(graph, s_mode, g_mode, extra_node_cost=extra_node_cost)
 
-    # 4) continuous planning along seq
     table_height = float(meta.get("table_height", 0.75))
 
     x_cur = np.asarray(x_s, dtype=float)
@@ -188,7 +222,6 @@ def plan_multimodal_v2(
         full.extend(seg_np[1:])
         x_cur = np.asarray(B.project(full[-1]), dtype=float)
 
-    # 5) final segment in goal mode to x_g
     GoalMode = modes[g_mode]
     seg_last = rrt_connect_on_mode(
         x_cur,

@@ -18,6 +18,136 @@ def rotz_deg(yaw_deg: float) -> np.ndarray:
     )
 
 
+def rotz_rad(yaw: float) -> np.ndarray:
+    c, s = np.cos(yaw), np.sin(yaw)
+    return np.array(
+        [
+            [c, -s, 0.0],
+            [s,  c, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+
+
+def wrap_to_pi(a: float) -> float:
+    return (a + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def rotation_matrix_to_rotvec(R: np.ndarray) -> np.ndarray:
+    R = np.asarray(R, dtype=float)
+    tr = np.trace(R)
+    cos_theta = np.clip((tr - 1.0) * 0.5, -1.0, 1.0)
+    theta = np.arccos(cos_theta)
+
+    if theta < 1e-9:
+        return np.zeros(3, dtype=float)
+
+    if np.pi - theta < 1e-6:
+        axis = np.sqrt(np.maximum((np.diag(R) + 1.0) * 0.5, 0.0))
+        axis = axis.astype(float)
+
+        if abs(axis[0]) > 1e-6:
+            axis[1] = np.copysign(axis[1], R[0, 1] + R[1, 0])
+            axis[2] = np.copysign(axis[2], R[0, 2] + R[2, 0])
+        elif abs(axis[1]) > 1e-6:
+            axis[0] = np.copysign(axis[0], R[0, 1] + R[1, 0])
+            axis[2] = np.copysign(axis[2], R[1, 2] + R[2, 1])
+        else:
+            axis[0] = np.copysign(axis[0], R[0, 2] + R[2, 0])
+            axis[1] = np.copysign(axis[1], R[1, 2] + R[2, 1])
+
+        n = np.linalg.norm(axis)
+        if n < 1e-9:
+            return np.zeros(3, dtype=float)
+        axis = axis / n
+        return axis * theta
+
+    skew = np.array(
+        [
+            R[2, 1] - R[1, 2],
+            R[0, 2] - R[2, 0],
+            R[1, 0] - R[0, 1],
+        ],
+        dtype=float,
+    )
+    axis = skew / (2.0 * np.sin(theta))
+    return axis * theta
+
+
+def orientation_error_rotvec(R_current: np.ndarray, R_desired: np.ndarray) -> np.ndarray:
+    R_err = np.asarray(R_desired, dtype=float) @ np.asarray(R_current, dtype=float).T
+    return rotation_matrix_to_rotvec(R_err)
+
+
+def _xy_yaw_from_R(R: np.ndarray) -> float:
+    x_axis = np.asarray(R, dtype=float)[:3, 0]
+    v = x_axis[:2]
+    n = np.linalg.norm(v)
+    if n < 1e-9:
+        return 0.0
+    return float(np.arctan2(v[1], v[0]))
+
+
+def make_payload_orientation(
+    mode_family: str,
+    travel_dir_world: np.ndarray | None = None,
+    R_nominal_world: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Reachable orientation target for the iiwa flange.
+
+    Strategy:
+    - use the robot's actual home EE orientation as the nominal carrying pose
+    - only apply a *small yaw correction around world z* following travel direction
+    - keep the flange tilt/roll close to the nominal reachable posture
+
+    This is much more stable than directly synthesizing a new flange frame.
+    """
+    if R_nominal_world is None:
+        # Safe fallback if caller forgets to pass the nominal home EE orientation
+        R_nominal_world = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+
+    R_nominal_world = np.asarray(R_nominal_world, dtype=float)
+
+    if travel_dir_world is None:
+        return R_nominal_world.copy()
+
+    d = np.asarray(travel_dir_world, dtype=float).copy()
+    d[2] = 0.0
+    n = np.linalg.norm(d)
+    if n < 1e-9:
+        return R_nominal_world.copy()
+
+    desired_yaw = float(np.arctan2(d[1], d[0]))
+    nominal_yaw = _xy_yaw_from_R(R_nominal_world)
+    yaw_error = wrap_to_pi(desired_yaw - nominal_yaw)
+
+    # Small, mode-dependent yaw following only.
+    if mode_family == "SupportContact":
+        yaw_gain = 0.15
+        yaw_limit_deg = 12.0
+    elif mode_family == "SupportTransition":
+        yaw_gain = 0.20
+        yaw_limit_deg = 18.0
+    else:
+        yaw_gain = 0.25
+        yaw_limit_deg = 25.0
+
+    yaw_cmd = yaw_gain * yaw_error
+    yaw_lim = np.deg2rad(yaw_limit_deg)
+    yaw_cmd = float(np.clip(yaw_cmd, -yaw_lim, yaw_lim))
+
+    return rotz_rad(yaw_cmd) @ R_nominal_world
+
+
 class IiwaIK:
     def __init__(self, urdf_path: str, ee_link_name: str, base_xyz, base_yaw_deg: float):
         self.robot = URDF.load(str(urdf_path))
@@ -76,6 +206,9 @@ class IiwaIK:
 
     def fk_world(self, q: np.ndarray) -> np.ndarray:
         return self.fk_world_transform(q)[:3, 3]
+
+    def fk_world_rotation(self, q: np.ndarray) -> np.ndarray:
+        return self.fk_world_transform(q)[:3, :3]
 
     def fk_all_link_world_points(self, q: np.ndarray) -> np.ndarray:
         fk = self.robot.link_fk(cfg=self._cfg_dict(q))
@@ -145,33 +278,41 @@ class IiwaIK:
                 return True
         return False
 
-    def solve_position_ik(
+    def solve_pose_ik(
         self,
         target_xyz,
+        target_R,
         q0,
-        pos_tol: float = 0.04,
+        *,
+        pos_tol: float = 0.07,
+        rot_tol_deg: float = 20.0,
         collision_boxes=None,
-        collision_margin: float = 0.05,
+        collision_margin: float = 0.02,
         min_ee_z: float | None = None,
-        n_restarts: int = 3,
+        n_restarts: int = 4,
         smooth_weight: float = 0.08,
+        orientation_weight: float = 0.10,
     ):
         target_xyz = np.asarray(target_xyz, dtype=float)
+        target_R = np.asarray(target_R, dtype=float)
         q0 = np.asarray(q0, dtype=float)
 
         def residual(q):
-            pos_res = self.fk_world(q) - target_xyz
+            T = self.fk_world_transform(q)
+            pos_res = T[:3, 3] - target_xyz
+            rot_res = orientation_error_rotvec(T[:3, :3], target_R)
             smooth_res = smooth_weight * (q - q0)
-            return np.concatenate([pos_res, smooth_res])
+            return np.concatenate([pos_res, orientation_weight * rot_res, smooth_res])
 
         seeds = [q0.copy()]
         for _ in range(n_restarts - 1):
-            noise = np.random.normal(scale=0.08, size=q0.shape)
+            noise = np.random.normal(scale=0.10, size=q0.shape)
             q_seed = np.clip(q0 + noise, self.lower, self.upper)
             seeds.append(q_seed)
 
         best_q = None
-        best_err = np.inf
+        best_pos_err = np.inf
+        best_rot_err_deg = np.inf
         best_ok = False
 
         for seed in seeds:
@@ -182,12 +323,17 @@ class IiwaIK:
                 xtol=1e-5,
                 ftol=1e-5,
                 gtol=1e-5,
-                max_nfev=250,
+                max_nfev=350,
             )
 
             q_sol = res.x
-            p_sol = self.fk_world(q_sol)
-            err = np.linalg.norm(p_sol - target_xyz)
+            T_sol = self.fk_world_transform(q_sol)
+            p_sol = T_sol[:3, 3]
+            R_sol = T_sol[:3, :3]
+
+            pos_err = float(np.linalg.norm(p_sol - target_xyz))
+            rot_err = orientation_error_rotvec(R_sol, target_R)
+            rot_err_deg = float(np.rad2deg(np.linalg.norm(rot_err)))
 
             ee_height_ok = True if min_ee_z is None else (p_sol[2] >= min_ee_z)
 
@@ -201,15 +347,20 @@ class IiwaIK:
                     skip_first_n_points=1,
                 )
 
-            ok = (err < pos_tol) and ee_height_ok and collision_ok
+            ok = (pos_err < pos_tol) and (rot_err_deg < rot_tol_deg) and ee_height_ok and collision_ok
 
-            if ok and err < best_err:
-                best_q = q_sol
-                best_err = err
-                best_ok = True
+            score = pos_err + 0.01 * rot_err_deg
 
-            if (not best_ok) and (err < best_err):
-                best_q = q_sol
-                best_err = err
+            if ok:
+                if (not best_ok) or (score < best_pos_err + 0.01 * best_rot_err_deg):
+                    best_q = q_sol
+                    best_pos_err = pos_err
+                    best_rot_err_deg = rot_err_deg
+                    best_ok = True
+            else:
+                if (not best_ok) and (score < best_pos_err + 0.01 * best_rot_err_deg):
+                    best_q = q_sol
+                    best_pos_err = pos_err
+                    best_rot_err_deg = rot_err_deg
 
-        return best_q, best_ok, float(best_err)
+        return best_q, best_ok, float(best_pos_err), float(best_rot_err_deg)

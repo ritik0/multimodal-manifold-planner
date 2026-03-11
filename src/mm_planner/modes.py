@@ -172,6 +172,40 @@ class ImplicitMode(Mode):
         return _clip_to_bounds(x, self.ambient_bounds)
 
 
+def _orientation_semantics_for_family(family: str) -> dict:
+    if family == "SupportContact":
+        return {
+            "keep_payload_horizontal": True,
+            "max_tilt_deg": 10.0,
+            "yaw_window_deg": 45.0,
+            "rot_tol_deg": 18.0,
+            "orientation_weight": 0.18,
+        }
+    if family == "SupportTransition":
+        return {
+            "keep_payload_horizontal": True,
+            "max_tilt_deg": 12.0,
+            "yaw_window_deg": 55.0,
+            "rot_tol_deg": 22.0,
+            "orientation_weight": 0.15,
+        }
+    if family == "FreeTransfer":
+        return {
+            "keep_payload_horizontal": True,
+            "max_tilt_deg": 15.0,
+            "yaw_window_deg": 70.0,
+            "rot_tol_deg": 28.0,
+            "orientation_weight": 0.12,
+        }
+    return {
+        "keep_payload_horizontal": True,
+        "max_tilt_deg": 15.0,
+        "yaw_window_deg": 70.0,
+        "rot_tol_deg": 28.0,
+        "orientation_weight": 0.12,
+    }
+
+
 def make_two_tables_problem_3d(
     *,
     L=0.45,
@@ -223,11 +257,21 @@ def make_two_tables_problem_3d(
     support_z = ht
     carry_z_min = ht + geom.object_radius + geom.carry_clearance
 
-    # Make lift/place bands overlap with free-transfer region
-    overlap_margin = 0.02
-    transition_band = max(0.05, (carry_z_min - support_z) + overlap_margin)
+    overlap_margin = 0.015
+    min_transition_band = 0.05
+    transition_band = max(min_transition_band, (carry_z_min - support_z) + overlap_margin)
     lift_band = transition_band
     place_band = transition_band
+
+    edge_transition_x_width = transition_width
+    if edge_transition_x_width is None:
+        edge_transition_x_width = max(0.08, geom.object_half_length + 0.01)
+    edge_transition_x_width = float(np.clip(edge_transition_x_width, 0.04, L))
+
+    left_transition_x_min = max(0.0, L - edge_transition_x_width)
+    left_transition_x_max = L
+    right_transition_x_min = L + G
+    right_transition_x_max = min(2.0 * L + G, L + G + edge_transition_x_width)
 
     def h_support_contact(p):
         return np.array([p[2] - support_z], dtype=float)
@@ -237,14 +281,14 @@ def make_two_tables_problem_3d(
 
     def proj_lift_from_left(p):
         pp = np.asarray(p, dtype=float).copy()
-        pp[0] = np.clip(pp[0], 0.0, L)
+        pp[0] = np.clip(pp[0], left_transition_x_min, left_transition_x_max)
         pp[1] = np.clip(pp[1], -support_y_limit, support_y_limit)
         pp[2] = np.clip(pp[2], support_z, min(z_max, support_z + lift_band))
         return pp
 
     def proj_place_on_right(p):
         pp = np.asarray(p, dtype=float).copy()
-        pp[0] = np.clip(pp[0], L + G, 2.0 * L + G)
+        pp[0] = np.clip(pp[0], right_transition_x_min, right_transition_x_max)
         pp[1] = np.clip(pp[1], -support_y_limit, support_y_limit)
         pp[2] = np.clip(pp[2], support_z, min(z_max, support_z + place_band))
         return pp
@@ -275,7 +319,7 @@ def make_two_tables_problem_3d(
     def valid_lift_from_left(p):
         x, y, z = p
         return (
-            0.0 <= x <= L
+            left_transition_x_min <= x <= left_transition_x_max
             and -support_y_limit <= y <= support_y_limit
             and support_z <= z <= min(z_max, support_z + lift_band)
         )
@@ -283,7 +327,7 @@ def make_two_tables_problem_3d(
     def valid_place_on_right(p):
         x, y, z = p
         return (
-            L + G <= x <= 2.0 * L + G
+            right_transition_x_min <= x <= right_transition_x_max
             and -support_y_limit <= y <= support_y_limit
             and support_z <= z <= min(z_max, support_z + place_band)
         )
@@ -323,6 +367,11 @@ def make_two_tables_problem_3d(
             "carry_z_min": carry_z_min,
             "place_band": place_band,
             "lift_band": lift_band,
+            "edge_transition_x_width": edge_transition_x_width,
+            "left_transition_x_min": left_transition_x_min,
+            "left_transition_x_max": left_transition_x_max,
+            "right_transition_x_min": right_transition_x_min,
+            "right_transition_x_max": right_transition_x_max,
         },
         "planning_policy_note": (
             "Support-contact motion is intentionally preferred. "
@@ -343,9 +392,7 @@ def make_two_tables_problem_3d(
             meta={
                 **common_meta,
                 "semantic_role": "preferred support-contact transport on left table",
-                "equality_constraints": ["z = support_z"],
-                "inequality_constraints": ["0 <= x <= L", "|y| <= support_y_limit"],
-                "transition_conditions": ["can remain in support-contact", "can transition to LiftFromLeftSupport"],
+                "orientation_semantics": _orientation_semantics_for_family("SupportContact"),
             },
             max_iters=geom.projection_max_iters,
             tol=geom.projection_tol,
@@ -359,17 +406,16 @@ def make_two_tables_problem_3d(
             ambient_bounds=ambient_bounds,
             is_valid=valid_lift_from_left,
             cost_weight=transition_cost,
-            params={"side": "left", "x_range": [0.0, L], "support_z": support_z, "lift_band": lift_band},
+            params={
+                "side": "left",
+                "x_range": [left_transition_x_min, left_transition_x_max],
+                "support_z": support_z,
+                "lift_band": lift_band,
+            },
             meta={
                 **common_meta,
                 "semantic_role": "lift initiation from left support",
-                "equality_constraints": [],
-                "inequality_constraints": [
-                    "0 <= x <= L",
-                    "|y| <= support_y_limit",
-                    f"support_z <= z <= support_z + {lift_band}",
-                ],
-                "transition_conditions": ["enters from SlideLeft", "exits to FreeTransferWorkspace"],
+                "orientation_semantics": _orientation_semantics_for_family("SupportTransition"),
             },
         ),
         Mode(
@@ -383,13 +429,7 @@ def make_two_tables_problem_3d(
             meta={
                 **common_meta,
                 "semantic_role": "workspace-wide unsupported transfer, penalized",
-                "equality_constraints": [],
-                "inequality_constraints": [
-                    "x_min <= x <= x_max",
-                    "|y| <= free_y_limit",
-                    "z >= carry_z_min",
-                ],
-                "transition_conditions": ["enters from support-lift", "exits to support-place or remains in free transfer"],
+                "orientation_semantics": _orientation_semantics_for_family("FreeTransfer"),
             },
         ),
         Mode(
@@ -399,17 +439,16 @@ def make_two_tables_problem_3d(
             ambient_bounds=ambient_bounds,
             is_valid=valid_place_on_right,
             cost_weight=transition_cost,
-            params={"side": "right", "x_range": [L + G, 2.0 * L + G], "support_z": support_z, "place_band": place_band},
+            params={
+                "side": "right",
+                "x_range": [right_transition_x_min, right_transition_x_max],
+                "support_z": support_z,
+                "place_band": place_band,
+            },
             meta={
                 **common_meta,
                 "semantic_role": "placement corridor onto right support",
-                "equality_constraints": [],
-                "inequality_constraints": [
-                    "L + G <= x <= 2L + G",
-                    "|y| <= support_y_limit",
-                    f"support_z <= z <= support_z + {place_band}",
-                ],
-                "transition_conditions": ["enters from FreeTransferWorkspace", "exits to SlideRight"],
+                "orientation_semantics": _orientation_semantics_for_family("SupportTransition"),
             },
         ),
         ImplicitMode(
@@ -424,9 +463,7 @@ def make_two_tables_problem_3d(
             meta={
                 **common_meta,
                 "semantic_role": "preferred support-contact transport on right table",
-                "equality_constraints": ["z = support_z"],
-                "inequality_constraints": ["L + G <= x <= 2L + G", "|y| <= support_y_limit"],
-                "transition_conditions": ["can be reached after placing on support", "preferred whenever support-contact is available"],
+                "orientation_semantics": _orientation_semantics_for_family("SupportContact"),
             },
             max_iters=geom.projection_max_iters,
             tol=geom.projection_tol,
@@ -458,6 +495,11 @@ def make_two_tables_problem_3d(
             "carry_z_min": carry_z_min,
             "place_band": place_band,
             "lift_band": lift_band,
+            "edge_transition_x_width": edge_transition_x_width,
+            "left_transition_x_min": left_transition_x_min,
+            "left_transition_x_max": left_transition_x_max,
+            "right_transition_x_min": right_transition_x_min,
+            "right_transition_x_max": right_transition_x_max,
         },
         "planning_preference": "prefer_support_contact_over_free_transfer",
         "projection_method": "damped_jacobian_least_squares",

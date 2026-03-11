@@ -14,7 +14,7 @@ from .robot_config import (
     get_default_ee_link_name,
     get_planning_height_limits,
 )
-from .iiwa_ik import IiwaIK
+from .iiwa_ik import IiwaIK, make_payload_orientation
 from .robot_viewer import visualize_two_tables_with_robot
 
 
@@ -61,23 +61,65 @@ def _make_table_collision_boxes(meta: dict):
     return [left_box, right_box]
 
 
-def _build_ik_targets(full_planned_path: np.ndarray, table_height: float, planning_max_z: float):
-    clearance_z = table_height + 0.04
-    base_tool_offset = 0.11
-    extra_table_offset = 0.04
+def _build_pose_targets(
+    full_planned_path: np.ndarray,
+    modes,
+    table_height: float,
+    planning_max_z: float,
+    nominal_R_world: np.ndarray,
+):
+    clearance_z = table_height + 0.01
+    base_tool_offset = 0.07
+    extra_table_offset = 0.015
 
-    ik_targets_full = full_planned_path.copy()
-    ik_targets_full[:, 2] += base_tool_offset
+    pose_positions = full_planned_path.copy()
+    pose_positions[:, 2] += base_tool_offset
 
     on_table_mask = full_planned_path[:, 2] <= table_height + 1e-3
-    ik_targets_full[on_table_mask, 2] += extra_table_offset
+    pose_positions[on_table_mask, 2] += extra_table_offset
 
-    ik_targets_full[:, 2] = np.maximum(
-        ik_targets_full[:, 2],
+    pose_positions[:, 2] = np.maximum(
+        pose_positions[:, 2],
         clearance_z + base_tool_offset,
     )
-    ik_targets_full[:, 2] = np.minimum(ik_targets_full[:, 2], planning_max_z + base_tool_offset)
-    return ik_targets_full
+    pose_positions[:, 2] = np.minimum(pose_positions[:, 2], planning_max_z + base_tool_offset)
+
+    pose_rotations = []
+    mode_names = []
+    rot_tols_deg = []
+    orientation_weights = []
+
+    n = len(full_planned_path)
+    for i, p in enumerate(full_planned_path):
+        m_idx, _ = pick_mode_for_state(p, modes)
+        mode = modes[m_idx]
+        mode_names.append(mode.name)
+
+        if i < n - 1:
+            travel = full_planned_path[i + 1] - full_planned_path[i]
+        elif i > 0:
+            travel = full_planned_path[i] - full_planned_path[i - 1]
+        else:
+            travel = np.array([1.0, 0.0, 0.0], dtype=float)
+
+        R_des = make_payload_orientation(
+            mode.family,
+            travel_dir_world=travel,
+            R_nominal_world=nominal_R_world,
+        )
+        pose_rotations.append(R_des)
+
+        ori = mode.meta.get("orientation_semantics", {})
+        rot_tols_deg.append(float(ori.get("rot_tol_deg", 20.0)))
+        orientation_weights.append(float(ori.get("orientation_weight", 0.10)))
+
+    return (
+        pose_positions,
+        np.asarray(pose_rotations, dtype=float),
+        mode_names,
+        np.asarray(rot_tols_deg, dtype=float),
+        np.asarray(orientation_weights, dtype=float),
+    )
 
 
 def _make_mode_preference_costs(modes):
@@ -94,20 +136,34 @@ def _make_mode_preference_costs(modes):
     return extra_node_cost
 
 
-def _sample_path_keep_ends(path: np.ndarray, ik_targets: np.ndarray, stride: int = 2):
+def _sample_path_keep_ends(
+    path: np.ndarray,
+    pose_positions: np.ndarray,
+    pose_rotations: np.ndarray,
+    rot_tols_deg: np.ndarray,
+    orientation_weights: np.ndarray,
+    stride: int = 2,
+):
     n = len(path)
     idx = list(range(0, n, stride))
     if idx[-1] != n - 1:
         idx.append(n - 1)
     idx = np.array(sorted(set(idx)), dtype=int)
-    return path[idx], ik_targets[idx], idx
+    return (
+        path[idx],
+        pose_positions[idx],
+        pose_rotations[idx],
+        rot_tols_deg[idx],
+        orientation_weights[idx],
+        idx,
+    )
 
 
 def evaluate_single_case(
     x_start: np.ndarray,
     x_goal: np.ndarray,
     *,
-    planner_seed: int = 7,
+    planner_seed: int = 70,
     L: float = 0.45,
     W: float = 0.40,
     G: float = 0.30,
@@ -164,12 +220,6 @@ def evaluate_single_case(
     )
     planner_time_sec = time.perf_counter() - t_plan_0
 
-    full_planned_path = path.copy()
-    ik_targets_full = _build_ik_targets(full_planned_path, table_height, planning_max_z)
-    sampled_exec_path, sampled_ik_targets, sampled_idx = _sample_path_keep_ends(
-        full_planned_path, ik_targets_full, stride=stride
-    )
-
     q_home = np.asarray(get_default_q_home(), dtype=float)
     base_pose = get_default_robot_base_pose()
     urdf_path = get_default_urdf_path()
@@ -181,39 +231,77 @@ def evaluate_single_case(
         base_yaw_deg=base_pose["yaw_deg"],
     )
 
+    nominal_R_world = ik.fk_world_rotation(q_home)
+
+    full_planned_path = path.copy()
+    pose_positions_full, pose_rotations_full, _, rot_tols_full, ori_weights_full = _build_pose_targets(
+        full_planned_path,
+        modes,
+        table_height,
+        planning_max_z,
+        nominal_R_world,
+    )
+
+    (
+        sampled_exec_path,
+        sampled_pose_positions,
+        sampled_pose_rotations,
+        sampled_rot_tols_deg,
+        sampled_orientation_weights,
+        sampled_idx,
+    ) = _sample_path_keep_ends(
+        full_planned_path,
+        pose_positions_full,
+        pose_rotations_full,
+        rot_tols_full,
+        ori_weights_full,
+        stride=stride,
+    )
+
     collision_boxes = _make_table_collision_boxes(meta)
 
     t_ik_0 = time.perf_counter()
     q_list = []
     oks = []
-    errs = []
+    pos_errs = []
+    rot_errs_deg = []
 
-    pos_tol = 0.04
-    collision_margin = 0.05
-    min_ee_z = table_height + 0.10
+    pos_tol = 0.07
+    collision_margin = 0.02
+    min_ee_z = table_height + 0.02
 
     q_prev = q_home.copy()
-    for target in sampled_ik_targets:
-        q_sol, ok, err = ik.solve_position_ik(
-            target,
+    for target_xyz, target_R, rot_tol_deg, ori_weight in zip(
+        sampled_pose_positions,
+        sampled_pose_rotations,
+        sampled_rot_tols_deg,
+        sampled_orientation_weights,
+    ):
+        q_sol, ok, pos_err, rot_err_deg = ik.solve_pose_ik(
+            target_xyz,
+            target_R,
             q_prev,
             pos_tol=pos_tol,
+            rot_tol_deg=float(rot_tol_deg),
             collision_boxes=collision_boxes,
             collision_margin=collision_margin,
             min_ee_z=min_ee_z,
-            n_restarts=3,
+            n_restarts=4,
             smooth_weight=0.08,
+            orientation_weight=float(ori_weight),
         )
         q_list.append(q_sol.copy())
         oks.append(ok)
-        errs.append(err)
+        pos_errs.append(pos_err)
+        rot_errs_deg.append(rot_err_deg)
         q_prev = q_sol
 
     ik_time_sec = time.perf_counter() - t_ik_0
 
     q_waypoints = np.asarray(q_list, dtype=float)
     oks = np.asarray(oks, dtype=bool)
-    errs = np.asarray(errs, dtype=float)
+    pos_errs = np.asarray(pos_errs, dtype=float)
+    rot_errs_deg = np.asarray(rot_errs_deg, dtype=float)
 
     s, e, chunk_policy = _pick_execution_chunk(oks, min_len=2)
 
@@ -266,8 +354,10 @@ def evaluate_single_case(
         "chunk_start_idx": int(s),
         "chunk_end_idx": int(e - 1),
         "chunk_len": int(max(0, e - s)),
-        "mean_ik_err": float(np.mean(errs)) if len(errs) else None,
-        "max_ik_err": float(np.max(errs)) if len(errs) else None,
+        "mean_pos_ik_err": float(np.mean(pos_errs)) if len(pos_errs) else None,
+        "max_pos_ik_err": float(np.max(pos_errs)) if len(pos_errs) else None,
+        "mean_rot_ik_err_deg": float(np.mean(rot_errs_deg)) if len(rot_errs_deg) else None,
+        "max_rot_ik_err_deg": float(np.max(rot_errs_deg)) if len(rot_errs_deg) else None,
         "executed_start_x": None if executed_start is None else float(executed_start[0]),
         "executed_start_y": None if executed_start is None else float(executed_start[1]),
         "executed_start_z": None if executed_start is None else float(executed_start[2]),
@@ -294,14 +384,14 @@ def evaluate_single_case(
 
 
 def demo_run_and_visualize_robot():
-    planner_seed = 7
+    planner_seed = 70
     L = 0.45
     W = 0.40
     G = 0.30
     table_height = 0.70
 
-    x_start = np.array([0.35, 0.00, 0.70], dtype=float)
-    x_goal  = np.array([1.05, 0.00, 0.70], dtype=float)
+    x_start = np.array([0.2, 0.00, 0.70], dtype=float)
+    x_goal = np.array([1.0, 0.00, 0.70], dtype=float)
 
     result = evaluate_single_case(
         x_start,
@@ -314,7 +404,6 @@ def demo_run_and_visualize_robot():
         verbose=True,
     )
 
-    # Re-run once for visualization data path
     z_limits = get_planning_height_limits(table_height)
     planning_max_z = z_limits["max_task_z"]
 
@@ -337,22 +426,18 @@ def demo_run_and_visualize_robot():
         modes=modes,
         ambient_bounds=ambient_bounds,
         meta=meta,
-        attempts_per_pair=1000,
-        max_transitions_per_edge=3,
+        attempts_per_pair=2000,
+        max_transitions_per_edge=5,
         base_switch_cost=1.0,
         extra_node_cost=extra_node_cost,
-        rrt_step=0.06,
-        rrt_iters=6000,
-        rrt_time_budget_sec=2.0,
-        goal_bias=0.35,
+        rrt_step=0.04,
+        rrt_iters=12000,
+        rrt_time_budget_sec=4.0,
+        goal_bias=0.30,
         forbid_direct_in_modes=["FreeTransferWorkspace"],
         transition_pick_policy="closest_on_src",
         seed=planner_seed,
     )
-
-    full_planned_path = path.copy()
-    ik_targets_full = _build_ik_targets(full_planned_path, table_height, planning_max_z)
-    sampled_exec_path, sampled_ik_targets, _ = _sample_path_keep_ends(full_planned_path, ik_targets_full, stride=2)
 
     q_home = np.asarray(get_default_q_home(), dtype=float)
     base_pose = get_default_robot_base_pose()
@@ -364,21 +449,57 @@ def demo_run_and_visualize_robot():
         base_xyz=base_pose["xyz"],
         base_yaw_deg=base_pose["yaw_deg"],
     )
+
+    nominal_R_world = ik.fk_world_rotation(q_home)
+
+    full_planned_path = path.copy()
+    pose_positions_full, pose_rotations_full, _, rot_tols_full, ori_weights_full = _build_pose_targets(
+        full_planned_path,
+        modes,
+        table_height,
+        planning_max_z,
+        nominal_R_world,
+    )
+
+    (
+        sampled_exec_path,
+        sampled_pose_positions,
+        sampled_pose_rotations,
+        sampled_rot_tols_deg,
+        sampled_orientation_weights,
+        _,
+    ) = _sample_path_keep_ends(
+        full_planned_path,
+        pose_positions_full,
+        pose_rotations_full,
+        rot_tols_full,
+        ori_weights_full,
+        stride=2,
+    )
+
     collision_boxes = _make_table_collision_boxes(meta)
 
     q_list = []
     oks = []
     q_prev = q_home.copy()
-    for target in sampled_ik_targets:
-        q_sol, ok, _ = ik.solve_position_ik(
-            target,
+    for target_xyz, target_R, rot_tol_deg, ori_weight in zip(
+        sampled_pose_positions,
+        sampled_pose_rotations,
+        sampled_rot_tols_deg,
+        sampled_orientation_weights,
+    ):
+        q_sol, ok, _, _ = ik.solve_pose_ik(
+            target_xyz,
+            target_R,
             q_prev,
-            pos_tol=0.04,
+            pos_tol=0.07,
+            rot_tol_deg=float(rot_tol_deg),
             collision_boxes=collision_boxes,
-            collision_margin=0.05,
-            min_ee_z=table_height + 0.10,
-            n_restarts=3,
+            collision_margin=0.02,
+            min_ee_z=table_height + 0.02,
+            n_restarts=4,
             smooth_weight=0.08,
+            orientation_weight=float(ori_weight),
         )
         q_list.append(q_sol.copy())
         oks.append(ok)
@@ -389,7 +510,7 @@ def demo_run_and_visualize_robot():
     s, e, _ = _pick_execution_chunk(oks, min_len=2)
 
     if e - s < 2:
-        raise RuntimeError("No sufficiently long collision-free IK chunk found for visualization.")
+        raise RuntimeError("No sufficiently long collision-free pose-IK chunk found for visualization.")
 
     q_waypoints_ok = q_waypoints[s:e]
     executed_path = sampled_exec_path[s:e]
@@ -425,6 +546,6 @@ def demo_run_and_visualize_robot():
         animate_payload=False,
         full_path=full_planned_path,
         executed_path=executed_path,
-        title=f"iiwa execution | support preferred | seed {planner_seed}",
+        title="",
         frame_dt=0.06,
     )
